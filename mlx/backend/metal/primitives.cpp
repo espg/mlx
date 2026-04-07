@@ -217,6 +217,7 @@ void Inverse::eval_gpu(const std::vector<array>& inputs, array& output) {
 }
 
 // Cholesky::eval_gpu is defined in cholesky.cpp
+// BlockTridiagCholesky::eval_gpu is defined in block_tridiag_cholesky.cpp
 
 void Eig::eval_gpu(
     const std::vector<array>& inputs,

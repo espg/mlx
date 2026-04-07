@@ -357,6 +357,36 @@ void init_linalg(nb::module_& parent_module) {
           array: :math:`\mathbf{A^{-1}}` where :math:`\mathbf{A} = \mathbf{L}\mathbf{L}^T`.
       )pbdoc");
   m.def(
+      "block_tridiag_cholesky",
+      [](const mx::array& D,
+         const mx::array& E,
+         mx::StreamOrDevice s) {
+        auto result = mx::linalg::block_tridiag_cholesky(D, E, s);
+        return nb::make_tuple(result.first, result.second);
+      },
+      "D"_a,
+      "E"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      nb::sig(
+          "def block_tridiag_cholesky(D: array, E: array, *, stream: Union[None, Stream, Device] = None) -> Tuple[array, array]"),
+      R"pbdoc(
+        Compute the Cholesky factorization of a block tridiagonal SPD matrix.
+
+        The block tridiagonal matrix is defined by diagonal blocks ``D`` and
+        off-diagonal blocks ``E``. Returns the block lower bidiagonal Cholesky
+        factor as ``(L_diag, L_offdiag)`` such that ``L @ L.T = A``.
+
+        Args:
+            D (array): Diagonal blocks of shape ``(..., N, n, n)``.
+            E (array): Off-diagonal blocks of shape ``(..., N-1, n, n)``.
+            stream (Stream, optional): Stream or device. Defaults to ``None``.
+
+        Returns:
+            tuple(array, array): A tuple ``(L_diag, L_offdiag)`` with the
+            same shapes as ``(D, E)``.
+      )pbdoc");
+  m.def(
       "pinv",
       &mx::linalg::pinv,
       "a"_a,

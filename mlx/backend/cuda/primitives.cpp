@@ -29,6 +29,7 @@ NO_GPU_MULTI(QRF)
 NO_GPU_MULTI(SVD)
 NO_GPU(Inverse)
 NO_GPU(Cholesky)
+NO_GPU_MULTI(BlockTridiagCholesky)
 NO_GPU_MULTI(Eig)
 NO_GPU_MULTI(Eigh)
 
