@@ -244,17 +244,82 @@ class TestLinalg(mlx_tests.MLXTestCase):
             [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], dtype=mx.float32
         )
         A = sqrtA.T @ sqrtA / 81
-        L = mx.linalg.cholesky(A, stream=mx.cpu)
-        U = mx.linalg.cholesky(A, upper=True, stream=mx.cpu)
+        L = mx.linalg.cholesky(A)
+        U = mx.linalg.cholesky(A, upper=True)
         self.assertTrue(mx.allclose(L @ L.T, A, rtol=1e-5, atol=1e-7))
         self.assertTrue(mx.allclose(U.T @ U, A, rtol=1e-5, atol=1e-7))
 
-        # Multiple matrices
-        B = A + 1 / 9
-        AB = mx.stack([A, B])
-        Ls = mx.linalg.cholesky(AB, stream=mx.cpu)
+        # Multiple matrices (ensure both are well-conditioned SPD)
+        A2 = A + 0.5 * mx.eye(3)
+        B2 = A + 1.0 * mx.eye(3)
+        AB = mx.stack([A2, B2])
+        Ls = mx.linalg.cholesky(AB)
         for M, L in zip(AB, Ls):
             self.assertTrue(mx.allclose(L @ L.T, M, rtol=1e-5, atol=1e-7))
+
+        # Test various sizes including blocked-algorithm boundary
+        np.random.seed(42)
+        for N in [1, 2, 4, 8, 16, 32, 33, 48, 64, 128, 256]:
+            A_np = np.random.randn(N, N).astype(np.float32)
+            A_np = A_np @ A_np.T + N * np.eye(N, dtype=np.float32)
+            A_mx = mx.array(A_np)
+
+            L_mx = np.array(mx.linalg.cholesky(A_mx))
+            L_np = np.linalg.cholesky(A_np)
+            self.assertTrue(
+                np.allclose(L_mx, L_np, rtol=1e-3, atol=1e-3),
+                msg=f"Cholesky mismatch at N={N}",
+            )
+
+            # Verify reconstruction
+            self.assertTrue(
+                mx.allclose(
+                    mx.array(L_mx) @ mx.array(L_mx).T,
+                    A_mx,
+                    rtol=1e-3,
+                    atol=1e-3,
+                ),
+                msg=f"Reconstruction failed at N={N}",
+            )
+
+        # Upper triangular for various sizes
+        for N in [4, 16, 32, 64]:
+            A_np = np.random.randn(N, N).astype(np.float32)
+            A_np = A_np @ A_np.T + N * np.eye(N, dtype=np.float32)
+            A_mx = mx.array(A_np)
+            U = mx.linalg.cholesky(A_mx, upper=True)
+            self.assertTrue(
+                mx.allclose(U.T @ U, A_mx, rtol=1e-3, atol=1e-3),
+                msg=f"Upper Cholesky failed at N={N}",
+            )
+
+        # Batched: 3D
+        N = 32
+        A_np = np.random.randn(5, N, N).astype(np.float32)
+        for i in range(5):
+            A_np[i] = A_np[i] @ A_np[i].T + N * np.eye(N, dtype=np.float32)
+        A_mx = mx.array(A_np)
+        Ls = mx.linalg.cholesky(A_mx)
+        for i in range(5):
+            self.assertTrue(
+                mx.allclose(Ls[i] @ Ls[i].T, A_mx[i], rtol=1e-3, atol=1e-3),
+                msg=f"Batched Cholesky failed at index {i}",
+            )
+
+        # Identity matrix
+        I = mx.eye(32)
+        L = mx.linalg.cholesky(I)
+        self.assertTrue(mx.allclose(L, I, atol=1e-5))
+
+        # GPU vs CPU consistency (if GPU available)
+        if mx.default_device() == mx.gpu:
+            N = 32
+            A_np = np.random.randn(N, N).astype(np.float32)
+            A_np = A_np @ A_np.T + N * np.eye(N, dtype=np.float32)
+            A_mx = mx.array(A_np)
+            L_gpu = mx.linalg.cholesky(A_mx, stream=mx.gpu)
+            L_cpu = mx.linalg.cholesky(A_mx, stream=mx.cpu)
+            self.assertTrue(mx.allclose(L_gpu, L_cpu, rtol=1e-5, atol=1e-5))
 
     def test_pseudo_inverse(self):
         A = mx.array([[1, 2, 3], [6, -5, 4], [-9, 8, 7]], dtype=mx.float32)
