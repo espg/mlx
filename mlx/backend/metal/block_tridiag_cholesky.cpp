@@ -79,8 +79,12 @@ void BlockTridiagCholesky::eval_gpu(
   }
 
   // Copy D_in → work[0..d_elems)
-  copy_gpu_inplace(D_in, work, {static_cast<int>(d_elems)},
-                   D_in.strides(), {1}, 0, 0, CopyType::General, s);
+  {
+    auto D_cont = contiguous_copy_gpu(D_in, s);
+    enc.add_temporary(D_cont);
+    copy_gpu_inplace(D_cont, work, {static_cast<int>(d_elems)},
+                     {1}, {1}, 0, 0, CopyType::Vector, s);
+  }
 
   // Copy E_In into E_all section, TRANSPOSING left-connection tiles.
   // E_all level 0 stores N-1 off-diags connecting consecutive blocks.

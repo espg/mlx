@@ -150,6 +150,11 @@ void BlockTridiagCholesky::eval_cpu(
             // C -= A · B^T
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         n, n, n, -1.0f, Er, n, El, n, 1.0f, En, n);
+            // If next_j is even, this tile is a LEFT connection at next level
+            // → transpose to match convention
+            if (next_j % 2 == 0) {
+              transpose_tile(En, n);
+            }
           }
         }
       }
