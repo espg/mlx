@@ -478,6 +478,44 @@ std::pair<array, array> block_tridiag_cholesky(
   return std::make_pair(out[0], out[1]);
 }
 
+array sparse_cholesky_factor(
+    const array& tile_data,
+    const array& potrf_offsets,
+    const array& trsm_l_offsets,
+    const array& trsm_b_offsets,
+    const array& trsm_col_ptr,
+    const array& syrk_c_offsets,
+    const array& syrk_a_offsets,
+    const array& syrk_col_ptr,
+    const array& gemm_c_offsets,
+    const array& gemm_a_offsets,
+    const array& gemm_b_offsets,
+    const array& gemm_col_ptr,
+    int tile_size,
+    StreamOrDevice s /* = {} */) {
+  check_float(tile_data.dtype(), "[linalg::sparse_cholesky_factor]");
+  if (tile_size != 16 && tile_size != 32) {
+    throw std::invalid_argument(
+        "[linalg::sparse_cholesky_factor] tile_size must be 16 or 32.");
+  }
+  return array(
+      tile_data.shape(),
+      tile_data.dtype(),
+      std::make_shared<SparseCholeskyFactor>(to_stream(s), tile_size),
+      {astype(tile_data, tile_data.dtype(), s),
+       astype(potrf_offsets, int32, s),
+       astype(trsm_l_offsets, int32, s),
+       astype(trsm_b_offsets, int32, s),
+       astype(trsm_col_ptr, int32, s),
+       astype(syrk_c_offsets, int32, s),
+       astype(syrk_a_offsets, int32, s),
+       astype(syrk_col_ptr, int32, s),
+       astype(gemm_c_offsets, int32, s),
+       astype(gemm_a_offsets, int32, s),
+       astype(gemm_b_offsets, int32, s),
+       astype(gemm_col_ptr, int32, s)});
+}
+
 array cross(
     const array& a,
     const array& b,

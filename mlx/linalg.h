@@ -90,6 +90,26 @@ MLX_API std::pair<array, array> block_tridiag_cholesky(
     const array& E,
     StreamOrDevice s = {});
 
+/** Sparse Cholesky numerical factorization on pre-computed CTSF tiles.
+ *  tile_data: flat float buffer of packed tiles.
+ *  The remaining arrays encode the task schedule (from Python symbolic analysis).
+ *  Returns factored tile_data (same shape). */
+MLX_API array sparse_cholesky_factor(
+    const array& tile_data,
+    const array& potrf_offsets,
+    const array& trsm_l_offsets,
+    const array& trsm_b_offsets,
+    const array& trsm_col_ptr,
+    const array& syrk_c_offsets,
+    const array& syrk_a_offsets,
+    const array& syrk_col_ptr,
+    const array& gemm_c_offsets,
+    const array& gemm_a_offsets,
+    const array& gemm_b_offsets,
+    const array& gemm_col_ptr,
+    int tile_size,
+    StreamOrDevice s = {});
+
 MLX_API std::vector<array> lu(const array& a, StreamOrDevice s = {});
 
 MLX_API std::pair<array, array> lu_factor(

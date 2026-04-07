@@ -106,6 +106,7 @@ target_sources(
           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/block_tridiag_cholesky.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/cholesky.cpp
+          ${CMAKE_CURRENT_SOURCE_DIR}/sparse_cholesky.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/compiled.cpp
           ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp

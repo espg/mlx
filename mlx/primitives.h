@@ -2496,6 +2496,26 @@ class BlockTridiagCholesky : public Primitive {
   DEFINE_NAME(BlockTridiagCholesky)
 };
 
+class SparseCholeskyFactor : public Primitive {
+ public:
+  explicit SparseCholeskyFactor(Stream stream, int tile_size)
+      : Primitive(stream), tile_size_(tile_size) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  auto state() const {
+    return tile_size_;
+  }
+
+  DEFINE_NAME(SparseCholeskyFactor)
+
+ private:
+  int tile_size_;
+};
+
 class Eig : public Primitive {
  public:
   explicit Eig(Stream stream, bool compute_eigenvectors)

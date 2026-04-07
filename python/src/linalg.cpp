@@ -387,6 +387,40 @@ void init_linalg(nb::module_& parent_module) {
             same shapes as ``(D, E)``.
       )pbdoc");
   m.def(
+      "sparse_cholesky_factor",
+      &mx::linalg::sparse_cholesky_factor,
+      "tile_data"_a,
+      "potrf_offsets"_a,
+      "trsm_l_offsets"_a,
+      "trsm_b_offsets"_a,
+      "trsm_col_ptr"_a,
+      "syrk_c_offsets"_a,
+      "syrk_a_offsets"_a,
+      "syrk_col_ptr"_a,
+      "gemm_c_offsets"_a,
+      "gemm_a_offsets"_a,
+      "gemm_b_offsets"_a,
+      "gemm_col_ptr"_a,
+      "tile_size"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"pbdoc(
+        Low-level numerical factorization for tile-based sparse Cholesky.
+
+        Operates on pre-computed CTSF tile data and a task schedule
+        produced by symbolic analysis.  Prefer the high-level
+        ``sparse_cholesky`` Python wrapper.
+
+        Args:
+            tile_data (array): Flat float32 buffer of packed tiles.
+            potrf_offsets .. gemm_col_ptr: Task-schedule arrays (int32).
+            tile_size (int): Side length of each tile (16 or 32).
+            stream (Stream, optional): Stream or device.
+
+        Returns:
+            array: Factored tile data (same shape as *tile_data*).
+      )pbdoc");
+  m.def(
       "pinv",
       &mx::linalg::pinv,
       "a"_a,
