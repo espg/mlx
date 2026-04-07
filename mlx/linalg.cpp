@@ -426,6 +426,58 @@ array cholesky_inv(
   }
 }
 
+std::pair<array, array> block_tridiag_cholesky(
+    const array& D,
+    const array& E,
+    StreamOrDevice s /* = {} */) {
+  check_float(D.dtype(), "[linalg::block_tridiag_cholesky]");
+  check_float(E.dtype(), "[linalg::block_tridiag_cholesky]");
+
+  if (D.ndim() < 3) {
+    throw std::invalid_argument(
+        "[linalg::block_tridiag_cholesky] D must have >= 3 dimensions "
+        "(batch dims + num_blocks + n + n).");
+  }
+  if (E.ndim() < 3) {
+    throw std::invalid_argument(
+        "[linalg::block_tridiag_cholesky] E must have >= 3 dimensions.");
+  }
+
+  int n = D.shape(-1);
+  if (D.shape(-2) != n) {
+    throw std::invalid_argument(
+        "[linalg::block_tridiag_cholesky] Diagonal blocks must be square.");
+  }
+  if (E.shape(-1) != n || E.shape(-2) != n) {
+    throw std::invalid_argument(
+        "[linalg::block_tridiag_cholesky] Off-diagonal blocks must be n x n.");
+  }
+
+  // D: (..., N, n, n), E: (..., N-1, n, n)
+  int num_blocks_d = D.shape(-3);
+  int num_blocks_e = E.shape(-3);
+  if (num_blocks_e != num_blocks_d - 1) {
+    throw std::invalid_argument(
+        "[linalg::block_tridiag_cholesky] E must have one fewer block than D "
+        "along axis -3.");
+  }
+  if (num_blocks_d < 2) {
+    throw std::invalid_argument(
+        "[linalg::block_tridiag_cholesky] Need at least 2 diagonal blocks.");
+  }
+
+  // Ensure same dtype
+  auto dtype = D.dtype();
+  auto E_cast = astype(E, dtype, s);
+
+  auto out = array::make_arrays(
+      {D.shape(), E.shape()},
+      {dtype, dtype},
+      std::make_shared<BlockTridiagCholesky>(to_stream(s)),
+      {D, E_cast});
+  return std::make_pair(out[0], out[1]);
+}
+
 array cross(
     const array& a,
     const array& b,

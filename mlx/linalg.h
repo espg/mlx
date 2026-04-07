@@ -82,6 +82,14 @@ MLX_API array pinv(const array& a, StreamOrDevice s = {});
 MLX_API array
 cholesky_inv(const array& a, bool upper = false, StreamOrDevice s = {});
 
+/** Block tridiagonal Cholesky factorization via nested dissection.
+ *  D: (batch, N, n, n) diagonal blocks, E: (batch, N-1, n, n) off-diag blocks.
+ *  Returns (L_diag, L_offdiag) with same shapes as (D, E). */
+MLX_API std::pair<array, array> block_tridiag_cholesky(
+    const array& D,
+    const array& E,
+    StreamOrDevice s = {});
+
 MLX_API std::vector<array> lu(const array& a, StreamOrDevice s = {});
 
 MLX_API std::pair<array, array> lu_factor(

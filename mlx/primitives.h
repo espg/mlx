@@ -2484,6 +2484,18 @@ class Cholesky : public UnaryPrimitive {
   bool upper_;
 };
 
+class BlockTridiagCholesky : public Primitive {
+ public:
+  explicit BlockTridiagCholesky(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+  void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs)
+      override;
+
+  DEFINE_NAME(BlockTridiagCholesky)
+};
+
 class Eig : public Primitive {
  public:
   explicit Eig(Stream stream, bool compute_eigenvectors)

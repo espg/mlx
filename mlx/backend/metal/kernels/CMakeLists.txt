@@ -48,6 +48,7 @@ endfunction(build_kernel)
 
 build_kernel(arg_reduce)
 build_kernel(cholesky)
+build_kernel(tile_blas tile_blas.h atomic.h)
 build_kernel(conv steel/conv/params.h)
 build_kernel(gemv steel/utils.h)
 build_kernel(layer_norm)
