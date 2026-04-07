@@ -39,9 +39,9 @@ void SparseCholeskyFactor::eval_gpu(
   }
 
   int n = tile_size_;
-  if (n != 16 && n != 32) {
+  if (n != 16 && n != 32 && n != 64) {
     throw std::runtime_error(
-        "[SparseCholeskyFactor::eval_gpu] tile_size must be 16 or 32.");
+        "[SparseCholeskyFactor::eval_gpu] tile_size must be 16, 32, or 64.");
   }
 
   auto& out = outputs[0];

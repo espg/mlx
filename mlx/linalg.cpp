@@ -470,8 +470,20 @@ std::pair<array, array> block_tridiag_cholesky(
   auto dtype = D.dtype();
   auto E_cast = astype(E, dtype, s);
 
+  // Compute n_E_total for nested dissection output
+  int N = num_blocks_d;
+  int n_E_total = 0;
+  for (int step = 1; step < N; step *= 2) {
+    int n_remain = (N + step - 1) / step;
+    n_E_total += n_remain - 1;
+  }
+
+  // E_all shape: same leading dims as E but with n_E_total blocks
+  auto e_all_shape = E.shape();
+  e_all_shape[e_all_shape.size() - 3] = n_E_total;
+
   auto out = array::make_arrays(
-      {D.shape(), E.shape()},
+      {D.shape(), e_all_shape},
       {dtype, dtype},
       std::make_shared<BlockTridiagCholesky>(to_stream(s)),
       {D, E_cast});
@@ -494,9 +506,9 @@ array sparse_cholesky_factor(
     int tile_size,
     StreamOrDevice s /* = {} */) {
   check_float(tile_data.dtype(), "[linalg::sparse_cholesky_factor]");
-  if (tile_size != 16 && tile_size != 32) {
+  if (tile_size != 16 && tile_size != 32 && tile_size != 64) {
     throw std::invalid_argument(
-        "[linalg::sparse_cholesky_factor] tile_size must be 16 or 32.");
+        "[linalg::sparse_cholesky_factor] tile_size must be 16, 32, or 64.");
   }
   return array(
       tile_data.shape(),

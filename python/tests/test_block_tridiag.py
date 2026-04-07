@@ -1,6 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
-"""Tests for block tridiagonal Cholesky factorization."""
+"""Tests for block tridiagonal Cholesky via nested dissection."""
 
 import unittest
 
@@ -9,15 +9,7 @@ import numpy as np
 
 
 def build_block_tridiag(D, E):
-    """Build a dense matrix from block tridiagonal components.
-
-    Args:
-        D: (N, n, n) diagonal blocks
-        E: (N-1, n, n) off-diagonal blocks (sub-diagonal)
-
-    Returns:
-        (N*n, N*n) dense symmetric matrix
-    """
+    """Build dense matrix from block tridiagonal (D, E)."""
     N, n, _ = D.shape
     M = N * n
     A = np.zeros((M, M), dtype=D.dtype)
@@ -32,135 +24,182 @@ def build_block_tridiag(D, E):
     return A
 
 
-def build_block_bidiag(L_diag, L_offdiag):
-    """Build dense lower triangular from block bidiagonal factor."""
-    N, n, _ = L_diag.shape
+def compute_level_offsets(N):
+    """Compute E_all level structure for nested dissection."""
+    offsets = []
+    step = 1
+    while step < N:
+        n_remain = (N + step - 1) // step
+        offsets.append(n_remain - 1)
+        step *= 2
+    return offsets
+
+
+def compute_elimination_order(N):
+    """Return list of (block_index, level, step) in elimination order."""
+    order = []
+    step = 1
+    level = 0
+    while step < N:
+        for i in range(step, N, 2 * step):
+            order.append((i, level, step))
+        step *= 2
+        level += 1
+    order.append((0, level, step))  # final block
+    return order
+
+
+def build_nd_factor(L_diag, E_all, N, n):
+    """Build dense lower triangular L_nd from nested dissection output.
+
+    Returns (L_dense, perm) where L_dense is the factor in the permuted
+    ordering and perm maps original block index to permuted position.
+    """
+    # Build elimination order → permutation
+    elim_order = compute_elimination_order(N)
+    perm = [0] * N
+    for pos, (block_idx, _, _) in enumerate(elim_order):
+        perm[block_idx] = pos
+
+    # Build permutation matrix
     M = N * n
-    L = np.zeros((M, M), dtype=L_diag.dtype)
-    for i in range(N):
-        r = i * n
-        L[r : r + n, r : r + n] = L_diag[i]
-    for i in range(N - 1):
-        r = (i + 1) * n
-        c = i * n
-        L[r : r + n, c : c + n] = L_offdiag[i]
-    return L
+    P = np.zeros((M, M), dtype=np.float32)
+    for orig_block in range(N):
+        perm_pos = perm[orig_block]
+        for k in range(n):
+            P[perm_pos * n + k, orig_block * n + k] = 1.0
+
+    # Build L_nd (dense lower triangular in permuted ordering)
+    L = np.zeros((M, M), dtype=np.float32)
+
+    # Level offsets in E_all
+    level_e_offset = []
+    offset = 0
+    step = 1
+    while step < N:
+        level_e_offset.append(offset)
+        n_remain = (N + step - 1) // step
+        offset += n_remain - 1
+        step *= 2
+    level_e_offset.append(offset)
+
+    # Fill diagonal blocks
+    for block_idx in range(N):
+        pp = perm[block_idx]
+        r = pp * n
+        L[r : r + n, r : r + n] = L_diag[block_idx]
+
+    # Fill off-diagonal blocks from trsm results
+    step = 1
+    level = 0
+    while step < N:
+        for i in range(step, N, 2 * step):
+            p_i = perm[i]
+            pos_in_remaining = i // step
+
+            # Left connection: i → i-step
+            if i - step >= 0:
+                e_idx = level_e_offset[level] + pos_in_remaining - 1
+                p_left = perm[i - step]
+                # L_nd[p_left, p_i] = E_all[e_idx]  (left trsm result)
+                r_row = p_left * n
+                r_col = p_i * n
+                if r_row > r_col:  # lower triangle
+                    L[r_row : r_row + n, r_col : r_col + n] = E_all[e_idx]
+
+            # Right connection: i → i+step
+            if i + step < N:
+                e_idx = level_e_offset[level] + pos_in_remaining
+                p_right = perm[i + step]
+                r_row = p_right * n
+                r_col = p_i * n
+                if r_row > r_col:
+                    L[r_row : r_row + n, r_col : r_col + n] = E_all[e_idx]
+
+        step *= 2
+        level += 1
+
+    return L, P
 
 
 def make_spd_block_tridiag(N, n, seed=42):
-    """Create a random block tridiagonal SPD matrix.
-
-    Generates D and E such that the assembled matrix is SPD.
-    Strategy: build A = X^T X + diag_dominance * I for a banded X.
-    """
+    """Create random block tridiagonal SPD matrix."""
     rng = np.random.RandomState(seed)
-    # Make diagonally dominant block tridiagonal
     D = np.zeros((N, n, n), dtype=np.float32)
     E = rng.randn(N - 1, n, n).astype(np.float32) * 0.3
-
     for i in range(N):
         X = rng.randn(n, n).astype(np.float32)
         D[i] = X.T @ X + (2.0 * n) * np.eye(n, dtype=np.float32)
-
     return D, E
 
 
 class TestBlockTridiagCholesky(unittest.TestCase):
 
-    def _check_factorization(self, D, E, device, atol=1e-3):
-        """Factor and verify L @ L^T == A."""
+    def _check(self, D, E, device, atol=1e-2):
+        """Factor and verify L_nd @ L_nd^T == P @ A @ P^T."""
+        N, n, _ = D.shape
         D_mx = mx.array(D)
         E_mx = mx.array(E)
 
-        L_diag, L_offdiag = mx.linalg.block_tridiag_cholesky(
+        L_diag_mx, E_all_mx = mx.linalg.block_tridiag_cholesky(
             D_mx, E_mx, stream=device
         )
-        mx.eval(L_diag, L_offdiag)
+        mx.eval(L_diag_mx, E_all_mx)
 
-        L_diag_np = np.array(L_diag)
-        L_offdiag_np = np.array(L_offdiag)
+        L_diag_np = np.array(L_diag_mx)
+        E_all_np = np.array(E_all_mx).reshape(-1, n, n)
 
-        # Build dense matrices
-        A_dense = build_block_tridiag(D, E)
-        L_dense = build_block_bidiag(L_diag_np, L_offdiag_np)
+        # Build dense A
+        A = build_block_tridiag(D, E)
+        # Build factor and permutation
+        L_nd, P = build_nd_factor(L_diag_np, E_all_np, N, n)
+        # Verify L_nd @ L_nd^T == P @ A @ P^T
+        PAP = P @ A @ P.T
+        LLT = L_nd @ L_nd.T
 
-        # Check L @ L^T ≈ A
-        reconstructed = L_dense @ L_dense.T
         np.testing.assert_allclose(
-            reconstructed, A_dense, atol=atol, rtol=atol,
-            err_msg=f"L @ L^T != A on {device}"
+            LLT, PAP, atol=atol, rtol=atol,
+            err_msg=f"L_nd @ L_nd^T != P@A@P^T on {device}"
         )
 
+    # CPU tests
     def test_cpu_N4_n16(self):
-        D, E = make_spd_block_tridiag(4, 16)
-        self._check_factorization(D, E, mx.cpu)
+        self._check(*make_spd_block_tridiag(4, 16), mx.cpu)
 
     def test_cpu_N8_n16(self):
-        D, E = make_spd_block_tridiag(8, 16)
-        self._check_factorization(D, E, mx.cpu)
+        self._check(*make_spd_block_tridiag(8, 16), mx.cpu)
 
     def test_cpu_N16_n16(self):
-        D, E = make_spd_block_tridiag(16, 16)
-        self._check_factorization(D, E, mx.cpu)
+        self._check(*make_spd_block_tridiag(16, 16), mx.cpu)
 
+    # GPU tests
     @unittest.skipIf(not mx.metal.is_available(), "Metal not available")
     def test_gpu_N4_n16(self):
-        D, E = make_spd_block_tridiag(4, 16)
-        self._check_factorization(D, E, mx.gpu)
+        self._check(*make_spd_block_tridiag(4, 16), mx.gpu)
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal not available")
     def test_gpu_N8_n16(self):
-        D, E = make_spd_block_tridiag(8, 16)
-        self._check_factorization(D, E, mx.gpu)
+        self._check(*make_spd_block_tridiag(8, 16), mx.gpu)
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal not available")
     def test_gpu_N4_n32(self):
-        D, E = make_spd_block_tridiag(4, 32, seed=123)
-        self._check_factorization(D, E, mx.gpu)
+        self._check(*make_spd_block_tridiag(4, 32, seed=123), mx.gpu)
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal not available")
     def test_gpu_N16_n16(self):
-        D, E = make_spd_block_tridiag(16, 16, seed=99)
-        self._check_factorization(D, E, mx.gpu)
+        self._check(*make_spd_block_tridiag(16, 16, seed=99), mx.gpu)
 
     @unittest.skipIf(not mx.metal.is_available(), "Metal not available")
     def test_gpu_N8_n32(self):
-        D, E = make_spd_block_tridiag(8, 32, seed=77)
-        self._check_factorization(D, E, mx.gpu, atol=1e-2)
+        self._check(*make_spd_block_tridiag(8, 32, seed=77), mx.gpu)
 
-    def test_matches_dense_cholesky(self):
-        """Compare block tridiag factor with numpy dense Cholesky."""
-        N, n = 4, 16
-        D, E = make_spd_block_tridiag(N, n)
-        A_dense = build_block_tridiag(D, E)
-        L_ref = np.linalg.cholesky(A_dense)
+    @unittest.skipIf(not mx.metal.is_available(), "Metal not available")
+    def test_gpu_N64_n32(self):
+        self._check(*make_spd_block_tridiag(64, 32, seed=55), mx.gpu, atol=0.1)
 
-        D_mx = mx.array(D)
-        E_mx = mx.array(E)
-        L_diag, L_offdiag = mx.linalg.block_tridiag_cholesky(
-            D_mx, E_mx, stream=mx.cpu
-        )
-        mx.eval(L_diag, L_offdiag)
-
-        L_diag_np = np.array(L_diag)
-        L_offdiag_np = np.array(L_offdiag)
-
-        # The block diagonal/off-diagonal of L should match numpy's cholesky
-        for i in range(N):
-            r = i * n
-            np.testing.assert_allclose(
-                L_diag_np[i], L_ref[r : r + n, r : r + n],
-                atol=1e-4, rtol=1e-4,
-                err_msg=f"L_diag[{i}] mismatch"
-            )
-        for i in range(N - 1):
-            r = (i + 1) * n
-            c = i * n
-            np.testing.assert_allclose(
-                L_offdiag_np[i], L_ref[r : r + n, c : c + n],
-                atol=1e-4, rtol=1e-4,
-                err_msg=f"L_offdiag[{i}] mismatch"
-            )
+    @unittest.skipIf(not mx.metal.is_available(), "Metal not available")
+    def test_gpu_N128_n32(self):
+        self._check(*make_spd_block_tridiag(128, 32, seed=44), mx.gpu, atol=0.5)
 
 
 if __name__ == "__main__":

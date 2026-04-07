@@ -14,6 +14,11 @@ using namespace metal;
 template <int N>
 constexpr constant int S = N + 1;
 
+// Stride for kernels that load two tiles into shared memory.
+// At N=64, 2×N×(N+1)×4 = 33,280 > 32,768, so we drop padding.
+template <int N>
+constexpr constant int S2 = (2 * N * (N + 1) * 4 <= 32768) ? (N + 1) : N;
+
 // ============================================================
 // tile_potrf: In-place lower Cholesky of N×N tiles
 //
@@ -241,6 +246,94 @@ template <int N>
 }
 
 // ============================================================
+// tile_gemm_bt: C -= A·Bᵀ
+//
+// Variant of gemm where B is transposed: C[i,j] -= sum_k A[i,k] * B[j,k]
+// Used for nested dissection fill-in where both operands come from right trsm.
+//
+// Grid: (num_ops, 1, 1), Threadgroup: (N, 1, 1)
+// ============================================================
+template <int N>
+[[kernel]] void tile_gemm_bt(
+    device float* tiles [[buffer(0)]],
+    const device int* offsets_c [[buffer(1)]],
+    const device int* offsets_a [[buffer(2)]],
+    const device int* offsets_b [[buffer(3)]],
+    uint op_idx [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]) {
+  device float* C_ptr = tiles + offsets_c[op_idx];
+  const device float* A_ptr = tiles + offsets_a[op_idx];
+  const device float* B_ptr = tiles + offsets_b[op_idx];
+
+  threadgroup float sA[N * S2<N>];
+  threadgroup float sB[N * S2<N>];
+
+  for (int row = 0; row < N; row++) {
+    sA[row * S2<N> + lid] = A_ptr[row * N + lid];
+    sB[row * S2<N> + lid] = B_ptr[row * N + lid];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // C[lid, j] -= sum_k A[lid, k] * B[j, k]  (B transposed)
+  float c[N];
+  for (int j = 0; j < N; j++) {
+    c[j] = C_ptr[lid * N + j];
+  }
+
+  for (int j = 0; j < N; j++) {
+    float sum = 0.0f;
+    for (int k = 0; k < N; k++) {
+      sum += sA[lid * S2<N> + k] * sB[j * S2<N> + k];
+    }
+    c[j] -= sum;
+  }
+
+  for (int j = 0; j < N; j++) {
+    C_ptr[lid * N + j] = c[j];
+  }
+}
+
+// ============================================================
+// tile_syrk_t_atomic: C -= Aᵀ·A with atomic updates (lower triangle)
+//
+// Transpose variant of syrk_atomic. Used for left-neighbor diagonal
+// updates in nested dissection where the left trsm gives Q = L⁻¹·E
+// and we need C -= Qᵀ·Q = Eᵀ·D⁻¹·E.
+//
+// C[i,j] -= sum_k A[k,i] * A[k,j]  for i >= j
+//
+// Grid: (num_ops, 1, 1), Threadgroup: (N, 1, 1)
+// ============================================================
+template <int N>
+[[kernel]] void tile_syrk_t_atomic(
+    device mlx_atomic<float>* tiles_out [[buffer(0)]],
+    const device float* tiles_in [[buffer(1)]],
+    const device int* offsets_c [[buffer(2)]],
+    const device int* offsets_a [[buffer(3)]],
+    uint op_idx [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]) {
+  int c_off = offsets_c[op_idx];
+  int a_off = offsets_a[op_idx];
+
+  threadgroup float sA[N * S<N>];
+
+  for (int row = 0; row < N; row++) {
+    sA[row * S<N> + lid] = tiles_in[a_off + row * N + lid];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // C[lid, j] -= sum_k A[k, lid] * A[k, j] for j = 0..lid
+  // Column lid of A = sA[k * S + lid] for k = 0..N-1
+  for (int j = 0; j <= int(lid); j++) {
+    float sum = 0.0f;
+    for (int k = 0; k < N; k++) {
+      sum += sA[k * S<N> + lid] * sA[k * S<N> + j];
+    }
+    mlx_atomic_fetch_add_explicit(tiles_out, -sum, c_off + lid * N + j);
+  }
+}
+
+// ============================================================
 // tile_gemm: C -= A·B
 //
 // Grid: (num_ops, 1, 1), Threadgroup: (N, 1, 1)
@@ -265,13 +358,13 @@ template <int N>
   const device float* A_ptr = tiles + offsets_a[op_idx];
   const device float* B_ptr = tiles + offsets_b[op_idx];
 
-  threadgroup float sA[N * S<N>];
-  threadgroup float sB[N * S<N>];
+  threadgroup float sA[N * S2<N>];
+  threadgroup float sB[N * S2<N>];
 
   // Coalesced load of A and B
   for (int row = 0; row < N; row++) {
-    sA[row * S<N> + lid] = A_ptr[row * N + lid];
-    sB[row * S<N> + lid] = B_ptr[row * N + lid];
+    sA[row * S2<N> + lid] = A_ptr[row * N + lid];
+    sB[row * S2<N> + lid] = B_ptr[row * N + lid];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -283,9 +376,9 @@ template <int N>
   }
 
   for (int k = 0; k < N; k++) {
-    float a = sA[lid * S<N> + k];
+    float a = sA[lid * S2<N> + k];
     for (int j = 0; j < N; j++) {
-      c[j] -= a * sB[k * S<N> + j];
+      c[j] -= a * sB[k * S2<N> + j];
     }
   }
 
@@ -319,19 +412,19 @@ template <int N>
   int a_off = offsets_a[op_idx];
   int b_off = offsets_b[op_idx];
 
-  threadgroup float sA[N * S<N>];
-  threadgroup float sB[N * S<N>];
+  threadgroup float sA[N * S2<N>];
+  threadgroup float sB[N * S2<N>];
 
   for (int row = 0; row < N; row++) {
-    sA[row * S<N> + lid] = tiles_in[a_off + row * N + lid];
-    sB[row * S<N> + lid] = tiles_in[b_off + row * N + lid];
+    sA[row * S2<N> + lid] = tiles_in[a_off + row * N + lid];
+    sB[row * S2<N> + lid] = tiles_in[b_off + row * N + lid];
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   for (int k = 0; k < N; k++) {
-    float a = sA[lid * S<N> + k];
+    float a = sA[lid * S2<N> + k];
     for (int j = 0; j < N; j++) {
-      float val = a * sB[k * S<N> + j];
+      float val = a * sB[k * S2<N> + j];
       mlx_atomic_fetch_add_explicit(tiles_out, -val, c_off + lid * N + j);
     }
   }
@@ -364,10 +457,136 @@ template <int N>
 }
 
 // ============================================================
-// Kernel instantiation for N=16 and N=32
+// block_tridiag_step: Fused syrk + potrf + trsm for one block
+// column of a block tridiagonal Cholesky factorization.
+//
+// Reduces dispatch count from 3N to N by keeping tiles in shared
+// memory across the three operations.
+//
+// Grid: (num_ops, 1, 1), Threadgroup: (N, 1, 1)
+// Each threadgroup processes one (batch, block) pair.
+//
+// Buffers:
+//   0: tiles      — combined work buffer (D then E tiles)
+//   1: d_offsets   — per-op element offset to D[i] tile
+//   2: eprev_offsets — per-op element offset to E[i-1] tile (-1 = skip syrk)
+//   3: ecurr_offsets — per-op element offset to E[i] tile (-1 = skip trsm)
+// ============================================================
+template <int N>
+[[kernel]] void block_tridiag_step(
+    device float* tiles [[buffer(0)]],
+    const device int* d_offsets [[buffer(1)]],
+    const device int* eprev_offsets [[buffer(2)]],
+    const device int* ecurr_offsets [[buffer(3)]],
+    uint op_idx [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]) {
+  constexpr int ST = S2<N>;  // stride that fits 2 tiles in 32 KB
+
+  int d_off = d_offsets[op_idx];
+  int ep_off = eprev_offsets[op_idx];
+  int ec_off = ecurr_offsets[op_idx];
+
+  device float* D = tiles + d_off;
+
+  threadgroup float sD[N * ST];  // D[i] tile (in-place syrk then potrf)
+  threadgroup float sE[N * ST];  // reused for E[i-1] then E[i]
+
+  // Load D[i]
+  for (int row = 0; row < N; row++) {
+    sD[row * ST + lid] = D[row * N + lid];
+  }
+
+  // ---- Step 1: syrk  D[i] -= E[i-1] · E[i-1]^T (if i > 0) ----
+  if (ep_off >= 0) {
+    const device float* Ep = tiles + ep_off;
+    for (int row = 0; row < N; row++) {
+      sE[row * ST + lid] = Ep[row * N + lid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float a_row[N];
+    for (int k = 0; k < N; k++) {
+      a_row[k] = sE[lid * ST + k];
+    }
+    for (int j = 0; j <= int(lid); j++) {
+      float sum = 0.0f;
+      for (int k = 0; k < N; k++) {
+        sum += a_row[k] * sE[j * ST + k];
+      }
+      sD[lid * ST + j] -= sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  } else {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // ---- Step 2: potrf  L_diag[i] = chol(D[i]) ----
+  for (int j = 0; j < N; j++) {
+    if (lid == 0) {
+      float sum = 0.0f;
+      for (int k = 0; k < j; k++) {
+        float v = sD[j * ST + k];
+        sum += v * v;
+      }
+      float d = sD[j * ST + j] - sum;
+      sD[j * ST + j] = (d > 0.0f) ? metal::sqrt(d) : NAN;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float diag = sD[j * ST + j];
+    for (int i = j + 1 + int(lid); i < N; i += N) {
+      float sum = 0.0f;
+      for (int k = 0; k < j; k++) {
+        sum += sD[i * ST + k] * sD[j * ST + k];
+      }
+      sD[i * ST + j] = (sD[i * ST + j] - sum) / diag;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Write factored D[i] back (lower triangle, zero upper)
+  for (int row = 0; row < N; row++) {
+    D[row * N + lid] = (row >= int(lid)) ? sD[row * ST + lid] : 0.0f;
+  }
+
+  // ---- Step 3: trsm  E[i] = E[i] · L_diag[i]^{-T} (if i < N-1) ----
+  if (ec_off >= 0) {
+    device float* Ec = tiles + ec_off;
+    // Load E[i] row by row into registers (each thread handles one row)
+    float b[N];
+    for (int j = 0; j < N; j++) {
+      b[j] = Ec[lid * N + j];
+    }
+
+    // Solve X · L^T = B  (L is in sD, lower triangular)
+    // Same as: L · X^T = B^T → forward substitution on rows
+    for (int j = 0; j < N; j++) {
+      float sum = 0.0f;
+      for (int k = 0; k < j; k++) {
+        sum += sD[j * ST + k] * b[k];
+      }
+      b[j] = (b[j] - sum) / sD[j * ST + j];
+    }
+
+    // Write back
+    for (int j = 0; j < N; j++) {
+      Ec[lid * N + j] = b[j];
+    }
+  }
+}
+
+// ============================================================
+// Kernel instantiation for N=16, 32, 64
 // ============================================================
 
 // clang-format off
 instantiate_tile_blas_all(16)
 instantiate_tile_blas_all(32)
+instantiate_tile_blas_all(64)
+instantiate_kernel("tile_gemm_bt_float32_16", tile_gemm_bt, 16)
+instantiate_kernel("tile_gemm_bt_float32_32", tile_gemm_bt, 32)
+instantiate_kernel("tile_gemm_bt_float32_64", tile_gemm_bt, 64)
+instantiate_kernel("block_tridiag_step_float32_16", block_tridiag_step, 16)
+instantiate_kernel("block_tridiag_step_float32_32", block_tridiag_step, 32)
+instantiate_kernel("block_tridiag_step_float32_64", block_tridiag_step, 64)
 // clang-format on

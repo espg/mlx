@@ -26,6 +26,9 @@
 #define instantiate_tile_syrk_atomic(N) \
     instantiate_kernel("tile_syrk_atomic_float32_" #N, tile_syrk_atomic, N)
 
+#define instantiate_tile_syrk_t_atomic(N) \
+    instantiate_kernel("tile_syrk_t_atomic_float32_" #N, tile_syrk_t_atomic, N)
+
 #define instantiate_tile_gemm(N) \
     instantiate_kernel("tile_gemm_float32_" #N, tile_gemm, N)
 
@@ -40,6 +43,7 @@
     instantiate_tile_trsm_all(N) \
     instantiate_tile_syrk(N) \
     instantiate_tile_syrk_atomic(N) \
+    instantiate_tile_syrk_t_atomic(N) \
     instantiate_tile_gemm(N) \
     instantiate_tile_gemm_atomic(N) \
     instantiate_tile_geadd(N)
