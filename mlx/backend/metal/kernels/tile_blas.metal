@@ -576,6 +576,254 @@ template <int N>
 }
 
 // ============================================================
+// nd_level_step: Fused nested dissection level kernel.
+//
+// One threadgroup per (block, batch) pair. Each threadgroup does:
+//   1. potrf on D[block_i]
+//   2. right trsm on E_right (if exists)
+//   3. left trsm on E_left (if exists)
+//   4. syrk on D[right_neighbor] via device memory (non-atomic, own row)
+//   5. syrk_t on D[left_neighbor] via device memory
+//   6. gemm_bt fill-in E_next (if both neighbors exist)
+//
+// No offset arrays needed — offsets computed from constants.
+//
+// Grid: (num_blocks_at_level * batch, 1, 1)
+// Threadgroup: (N, 1, 1)
+//
+// Buffers:
+//   0: d_tiles   — D tile storage (batch * N_blocks * N * N)
+//   1: e_tiles   — E_all tile storage (batch * n_E_total * N * N)
+//
+// Constants (set_bytes):
+//   2: step        — current level step (1, 2, 4, ...)
+//   3: N_blocks    — total number of diagonal blocks
+//   4: n_E_total   — total E_all tiles per batch
+//   5: num_at_level— number of blocks processed at this level
+//   6: level_e_off — E_all tile index offset for this level
+//   7: next_e_off  — E_all tile index offset for next level (fill-in dest)
+// ============================================================
+template <int N>
+[[kernel]] void nd_level_step(
+    device float* d_tiles [[buffer(0)]],
+    device float* e_tiles [[buffer(1)]],
+    constant int& step [[buffer(2)]],
+    constant int& N_blocks [[buffer(3)]],
+    constant int& n_E_total [[buffer(4)]],
+    constant int& num_at_level [[buffer(5)]],
+    constant int& level_e_off [[buffer(6)]],
+    constant int& next_e_off [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]) {
+
+  constexpr int nn = N * N;
+  constexpr int ST = S2<N>;
+
+  // Decode (block_index_within_level, batch_index) from tgid
+  int block_local = tgid / 1;  // will be tgid % num_at_level after batch split
+  int batch_idx = tgid / num_at_level;
+  int local_idx = tgid % num_at_level;
+
+  // The i-th block at this level is at position: step + local_idx * 2 * step
+  int block_i = step + local_idx * 2 * step;
+  if (block_i >= N_blocks) return;
+
+  int pos = block_i / step; // position in remaining set
+  bool has_left = (block_i - step >= 0);
+  bool has_right = (block_i + step < N_blocks);
+
+  // Tile pointers
+  device float* Di = d_tiles + (batch_idx * N_blocks + block_i) * nn;
+
+  int el_tile = has_left ? (level_e_off + pos - 1) : -1;
+  int er_tile = has_right ? (level_e_off + pos) : -1;
+
+  device float* El = has_left ?
+      (e_tiles + (batch_idx * n_E_total + el_tile) * nn) : nullptr;
+  device float* Er = has_right ?
+      (e_tiles + (batch_idx * n_E_total + er_tile) * nn) : nullptr;
+
+  threadgroup float sD[N * ST];
+  threadgroup float sE[N * ST]; // reused for left then right
+
+  // ---- Load D[i] ----
+  for (int row = 0; row < N; row++)
+    sD[row * ST + lid] = Di[row * N + lid];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // ---- potrf ----
+  for (int j = 0; j < N; j++) {
+    if (lid == 0) {
+      float sum = 0.0f;
+      for (int k = 0; k < j; k++) {
+        float v = sD[j * ST + k]; sum += v * v;
+      }
+      float d = sD[j * ST + j] - sum;
+      sD[j * ST + j] = (d > 0.0f) ? metal::sqrt(d) : NAN;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float diag = sD[j * ST + j];
+    for (int i2 = j + 1 + int(lid); i2 < N; i2 += N) {
+      float sum = 0.0f;
+      for (int k = 0; k < j; k++)
+        sum += sD[i2 * ST + k] * sD[j * ST + k];
+      sD[i2 * ST + j] = (sD[i2 * ST + j] - sum) / diag;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Write D[i] back (lower triangle)
+  for (int row = 0; row < N; row++)
+    Di[row * N + lid] = (row >= int(lid)) ? sD[row * ST + lid] : 0.0f;
+  threadgroup_barrier(mem_flags::mem_device);
+
+  // ---- Right trsm: Er = Er · L^{-T} ----
+  // Thread lid handles row lid of Er
+  if (has_right) {
+    float b[N];
+    for (int j = 0; j < N; j++) b[j] = Er[lid * N + j];
+    for (int j = 0; j < N; j++) {
+      float sum = 0.0f;
+      for (int k = 0; k < j; k++) sum += sD[j * ST + k] * b[k];
+      b[j] = (b[j] - sum) / sD[j * ST + j];
+    }
+    for (int j = 0; j < N; j++) Er[lid * N + j] = b[j];
+  }
+
+  // ---- Left trsm: El(stored as E^T) = El · L^{-T} ----
+  if (has_left) {
+    float b[N];
+    for (int j = 0; j < N; j++) b[j] = El[lid * N + j];
+    for (int j = 0; j < N; j++) {
+      float sum = 0.0f;
+      for (int k = 0; k < j; k++) sum += sD[j * ST + k] * b[k];
+      b[j] = (b[j] - sum) / sD[j * ST + j];
+    }
+    for (int j = 0; j < N; j++) El[lid * N + j] = b[j];
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+
+  // ---- syrk on right neighbor: D[i+step] -= Er · Er^T ----
+  if (has_right) {
+    device float* Dn = d_tiles + (batch_idx * N_blocks + block_i + step) * nn;
+    // Load Er into shared memory for reuse
+    for (int row = 0; row < N; row++)
+      sE[row * ST + lid] = Er[row * N + lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float a_row[N];
+    for (int k = 0; k < N; k++) a_row[k] = sE[lid * ST + k];
+    for (int j = 0; j <= int(lid); j++) {
+      float sum = 0.0f;
+      for (int k = 0; k < N; k++) sum += a_row[k] * sE[j * ST + k];
+      // Use atomic to handle multiple blocks updating same neighbor
+      device atomic<float>* dst = reinterpret_cast<device atomic<float>*>(Dn);
+      atomic_fetch_add_explicit(&dst[lid * N + j], -sum, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+  }
+
+  // ---- syrk_t on left neighbor: D[i-step] -= El^T · El ----
+  if (has_left) {
+    device float* Dn = d_tiles + (batch_idx * N_blocks + block_i - step) * nn;
+    for (int row = 0; row < N; row++)
+      sE[row * ST + lid] = El[row * N + lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // C[lid, j] -= sum_k sE[k, lid] * sE[k, j]  (column-dot)
+    for (int j = 0; j <= int(lid); j++) {
+      float sum = 0.0f;
+      for (int k = 0; k < N; k++)
+        sum += sE[k * ST + lid] * sE[k * ST + j];
+      device atomic<float>* dst = reinterpret_cast<device atomic<float>*>(Dn);
+      atomic_fetch_add_explicit(&dst[lid * N + j], -sum, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+  }
+
+  // ---- gemm_bt fill-in: E_next -= Er · El^T ----
+  if (has_left && has_right) {
+    int next_j = (block_i - step) / (2 * step);
+    int en_tile = next_e_off + next_j;
+    device float* En = e_tiles + (batch_idx * n_E_total + en_tile) * nn;
+
+    // Er is already in Er pointer, El in El pointer.
+    // Load Er into sE for row access by thread lid.
+    for (int row = 0; row < N; row++)
+      sE[row * ST + lid] = Er[row * N + lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // C[lid, j] -= sum_k Er[lid, k] * El[j, k]
+    // El is in device memory, read row j.
+    float c[N];
+    for (int j = 0; j < N; j++) c[j] = En[lid * N + j];
+
+    for (int j = 0; j < N; j++) {
+      float sum = 0.0f;
+      for (int k = 0; k < N; k++)
+        sum += sE[lid * ST + k] * El[j * N + k];
+      c[j] -= sum;
+    }
+    for (int j = 0; j < N; j++) En[lid * N + j] = c[j];
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Transpose E_next if it will be a left connection at next level
+    if (next_j % 2 == 0) {
+      // In-place transpose using shared memory
+      for (int row = 0; row < N; row++)
+        sE[row * ST + lid] = En[row * N + lid];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int row = 0; row < N; row++)
+        En[row * N + lid] = sE[lid * ST + row];
+    }
+  }
+}
+
+// ============================================================
+// nd_final_potrf: Factor the root block (block 0) after all levels.
+//
+// Grid: (batch, 1, 1), Threadgroup: (N, 1, 1)
+// ============================================================
+template <int N>
+[[kernel]] void nd_final_potrf(
+    device float* d_tiles [[buffer(0)]],
+    constant int& N_blocks [[buffer(1)]],
+    uint batch_idx [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]) {
+  constexpr int nn = N * N;
+  constexpr int ST = S<N>;
+  device float* D0 = d_tiles + batch_idx * N_blocks * nn;
+
+  threadgroup float sD[N * ST];
+  for (int row = 0; row < N; row++)
+    sD[row * ST + lid] = D0[row * N + lid];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int j = 0; j < N; j++) {
+    if (lid == 0) {
+      float sum = 0.0f;
+      for (int k = 0; k < j; k++) {
+        float v = sD[j * ST + k]; sum += v * v;
+      }
+      float d = sD[j * ST + j] - sum;
+      sD[j * ST + j] = (d > 0.0f) ? metal::sqrt(d) : NAN;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float diag = sD[j * ST + j];
+    for (int i2 = j + 1 + int(lid); i2 < N; i2 += N) {
+      float sum = 0.0f;
+      for (int k = 0; k < j; k++)
+        sum += sD[i2 * ST + k] * sD[j * ST + k];
+      sD[i2 * ST + j] = (sD[i2 * ST + j] - sum) / diag;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (int row = 0; row < N; row++)
+    D0[row * N + lid] = (row >= int(lid)) ? sD[row * ST + lid] : 0.0f;
+}
+
+// ============================================================
 // Kernel instantiation for N=16, 32, 64
 // ============================================================
 
@@ -589,4 +837,10 @@ instantiate_kernel("tile_gemm_bt_float32_64", tile_gemm_bt, 64)
 instantiate_kernel("block_tridiag_step_float32_16", block_tridiag_step, 16)
 instantiate_kernel("block_tridiag_step_float32_32", block_tridiag_step, 32)
 instantiate_kernel("block_tridiag_step_float32_64", block_tridiag_step, 64)
+instantiate_kernel("nd_level_step_float32_16", nd_level_step, 16)
+instantiate_kernel("nd_level_step_float32_32", nd_level_step, 32)
+instantiate_kernel("nd_level_step_float32_64", nd_level_step, 64)
+instantiate_kernel("nd_final_potrf_float32_16", nd_final_potrf, 16)
+instantiate_kernel("nd_final_potrf_float32_32", nd_final_potrf, 32)
+instantiate_kernel("nd_final_potrf_float32_64", nd_final_potrf, 64)
 // clang-format on
